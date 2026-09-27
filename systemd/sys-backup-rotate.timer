@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly backup with GFS retention
+Documentation=https://github.com/leodarshantech/linux-systems-toolkit
+
+[Timer]
+OnCalendar=*-*-* 02:30:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

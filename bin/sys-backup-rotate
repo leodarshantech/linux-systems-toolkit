@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# sys-backup-rotate — compressed, checksummed backups with GFS retention
+#
+# Creates <name>_<YYYYmmddTHHMMSS>.tar.{zst,gz} archives plus a sha256sum(1)
+# compatible sidecar, then prunes old archives with a grandfather-father-son
+# policy (default: 7 daily, 4 weekly, 3 monthly).
+#
+# Part of linux-systems-toolkit: https://github.com/leodarshantech/linux-systems-toolkit
+# Author: Leo Darshan (@leodarshantech)
+# License: MIT
+# ==============================================================================
+
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+for lib in "${self%/*}/../lib/common.sh" "${self%/*}/../lib/linux-systems-toolkit/common.sh"; do
+    if [[ -r "$lib" ]]; then
+        # shellcheck source=../lib/common.sh
+        . "$lib"
+        break
+    fi
+done
+[[ -n "${LST_VERSION:-}" ]] || { echo "${0##*/}: cannot find lib/common.sh" >&2; exit 2; }
+
+LST_USAGE_EXIT=2
+
+DEST=''
+NAME="$(lst_hostname)"
+NAME="${NAME%%.*}"
+COMPRESS=auto
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=3
+MODE=backup        # backup | prune | verify
+PRUNE=1
+DRY_RUN=0
+ONE_FS=0
+EXCLUDES=()
+SOURCES=()
+
+usage() {
+    cat <<EOF
+Usage: ${LST_PROG} --dest DIR [OPTIONS] SOURCE...
+       ${LST_PROG} --dest DIR --prune-only [OPTIONS]
+       ${LST_PROG} --dest DIR --verify [OPTIONS]
+
+Archive SOURCE directories into DIR, write a SHA-256 checksum next to each
+archive, then apply grandfather-father-son retention.
+
+Options:
+  -d, --dest DIR          Backup directory (required)
+      --name NAME         Archive name prefix (default: short hostname)
+  -z, --compress ALGO     zstd, gzip or auto (default: auto = zstd if installed)
+  -e, --exclude PATTERN   tar exclude pattern; repeatable (e.g. '/home/*/.cache')
+  -x, --one-file-system   Do not cross filesystem boundaries inside a SOURCE
+      --keep-daily N      Newest archive of each of the last N days   (default: ${KEEP_DAILY})
+      --keep-weekly N     ... of each of the last N ISO weeks         (default: ${KEEP_WEEKLY})
+      --keep-monthly N    ... of each of the last N months            (default: ${KEEP_MONTHLY})
+      --no-prune          Create the archive but skip retention
+      --prune-only        Apply retention without creating an archive
+      --verify            Check every archive's checksum and compression
+  -n, --dry-run           Show what would happen without writing anything
+  -q, --quiet             Only log warnings and errors
+  -v, --version           Print version and exit
+  -h, --help              Print this help and exit
+
+Retention works like borg/restic: each rule keeps the newest archive per
+period, and archives already kept by an earlier rule do not count again.
+
+Restore:
+  sha256sum -c NAME_TIMESTAMP.tar.zst.sha256
+  tar --zstd -xpf NAME_TIMESTAMP.tar.zst -C /restore/target
+
+Exit status: 0 success, 1 failure, 2 usage error.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)      usage; exit 0 ;;
+        -v|--version)   echo "${LST_PROG} ${LST_VERSION}"; exit 0 ;;
+        -d|--dest)      lst_need_arg "$@"; DEST="$2"; shift ;;
+        --name)         lst_need_arg "$@"; NAME="$2"; shift ;;
+        -z|--compress)  lst_need_arg "$@"; COMPRESS="$2"; shift ;;
+        -e|--exclude)   lst_need_arg "$@"; EXCLUDES+=("$2"); shift ;;
+        -x|--one-file-system) ONE_FS=1 ;;
+        --keep-daily)   lst_need_arg "$@"; lst_uint "$1" "$2" KEEP_DAILY; shift ;;
+        --keep-weekly)  lst_need_arg "$@"; lst_uint "$1" "$2" KEEP_WEEKLY; shift ;;
+        --keep-monthly) lst_need_arg "$@"; lst_uint "$1" "$2" KEEP_MONTHLY; shift ;;
+        --no-prune)     PRUNE=0 ;;
+        --prune-only)   MODE=prune ;;
+        --verify)       MODE=verify ;;
+        -n|--dry-run)   DRY_RUN=1 ;;
+        -q|--quiet)     LST_QUIET=1 ;;
+        --)             shift; SOURCES+=("$@"); break ;;
+        -*)             lst_usage_error "unknown option '$1'" ;;
+        *)              SOURCES+=("$1") ;;
+    esac
+    shift
+done
+
+[[ -n "$DEST" ]] || lst_usage_error "--dest is required"
+[[ "$NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || lst_usage_error "--name may only contain letters, digits, '.', '_' and '-'"
+(( KEEP_DAILY + KEEP_WEEKLY + KEEP_MONTHLY > 0 )) \
+    || lst_usage_error "at least one --keep-* value must be greater than zero"
+if [[ "$MODE" == backup ]]; then
+    (( ${#SOURCES[@]} > 0 )) || lst_usage_error "no SOURCE given"
+elif (( ${#SOURCES[@]} > 0 )); then
+    lst_usage_error "SOURCE arguments are not used with --prune-only or --verify"
+fi
+
+case "$COMPRESS" in
+    auto) if command -v zstd >/dev/null 2>&1; then COMPRESS=zstd; else COMPRESS=gzip; fi ;;
+    zstd|gzip) ;;
+    *) lst_usage_error "--compress must be zstd, gzip or auto" ;;
+esac
+case "$COMPRESS" in
+    zstd) EXT=zst COMPRESSOR=(zstd -q -T0 -c) ;;
+    gzip) EXT=gz  COMPRESSOR=(gzip -6 -c) ;;
+esac
+if [[ "$MODE" == backup ]] && ! command -v "$COMPRESS" >/dev/null 2>&1; then
+    lst_die "$COMPRESS is not installed"
+fi
+
+# Archives contain things like /etc/shadow: never create them group/world readable.
+umask 077
+
+# ------------------------------------------------------------------------------
+# Archive helpers
+# ------------------------------------------------------------------------------
+
+ARCHIVE_RE='^[0-9]{8}T[0-9]{6}\.tar\.(zst|gz)$'
+
+# list_archives: this NAME's archives in DEST, newest first.
+list_archives() {
+    local path base
+    for path in "$DEST/${NAME}_"*.tar.*; do
+        base="${path##*/}"
+        [[ "${base#"${NAME}"_}" =~ $ARCHIVE_RE ]] && printf '%s\n' "$base"
+    done | sort -r
+}
+
+archive_ts() {
+    local ts="${1#"${NAME}"_}"
+    printf '%s' "${ts:0:15}"
+}
+
+# period_key <daily|weekly|monthly> <YYYYmmddTHHMMSS>
+period_key() {
+    case "$1" in
+        daily)   printf '%s' "${2:0:8}" ;;
+        weekly)  date -d "${2:0:4}-${2:4:2}-${2:6:2}" +%G-W%V ;;
+        monthly) printf '%s' "${2:0:6}" ;;
+    esac
+}
+
+# test_compression <file>: integrity-check an archive's compression stream.
+test_compression() {
+    case "$1" in
+        *.zst) zstd -q -t < "$1" ;;
+        *.gz)  gzip -t < "$1" ;;
+    esac
+}
+
+remove() {
+    if (( DRY_RUN )); then
+        lst_log INFO "would delete $1"
+    else
+        rm -f -- "$DEST/$1" "$DEST/$1.sha256"
+        lst_log INFO "deleted $1"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Modes
+# ------------------------------------------------------------------------------
+
+do_backup() {
+    local ts archive tmp src rel start elapsed hash size tar_help dest_abs
+    local -a tar_args=(--create --file=- --directory=/) rel_sources=() rc
+
+    for src in "${SOURCES[@]}"; do
+        src="$(realpath -e -- "$src" 2>/dev/null)" || lst_die "source does not exist: $src"
+        rel="${src#/}"
+        rel_sources+=("${rel:-.}")
+    done
+
+    # Preserve ACLs, xattrs and SELinux labels when this tar supports them.
+    tar_help="$(tar --help 2>/dev/null || true)"
+    [[ "$tar_help" == *--acls* ]] && tar_args+=(--acls)
+    [[ "$tar_help" == *--xattrs* ]] && tar_args+=(--xattrs)
+    [[ "$tar_help" == *--selinux* && -d /sys/fs/selinux ]] && tar_args+=(--selinux)
+    (( ONE_FS )) && tar_args+=(--one-file-system)
+
+    # Never archive the backup directory itself, even if a SOURCE contains it.
+    dest_abs="$(realpath -m -- "$DEST")"
+    tar_args+=(--exclude="${dest_abs#/}")
+    for src in "${EXCLUDES[@]}"; do
+        tar_args+=(--exclude="${src#/}")
+    done
+
+    ts="$(date +%Y%m%dT%H%M%S)"
+    archive="${NAME}_${ts}.tar.${EXT}"
+    tmp="$DEST/.${archive}.partial"
+
+    if (( DRY_RUN )); then
+        lst_log INFO "would create $DEST/$archive from: ${SOURCES[*]}"
+        return
+    fi
+    [[ ! -e "$DEST/$archive" ]] || lst_die "$archive already exists"
+
+    lst_log INFO "creating $archive from: ${SOURCES[*]}"
+    start=$SECONDS
+    set +e
+    tar "${tar_args[@]}" -- "${rel_sources[@]}" | "${COMPRESSOR[@]}" > "$tmp"
+    rc=("${PIPESTATUS[@]}")
+    set -e
+
+    # GNU tar exits 1 when a file changed while being read; the archive is
+    # still usable, so that is a warning rather than a failure.
+    if (( rc[0] > 1 || rc[1] != 0 )); then
+        rm -f -- "$tmp"
+        lst_die "archive failed (tar exit ${rc[0]}, ${COMPRESSOR[0]} exit ${rc[1]})"
+    fi
+    (( rc[0] == 0 )) || lst_log WARN "some files changed while being archived"
+
+    if ! test_compression "$tmp"; then
+        rm -f -- "$tmp"
+        lst_die "compression self-test failed for $archive"
+    fi
+
+    hash="$(sha256sum < "$tmp")"
+    printf '%s  %s\n' "${hash%% *}" "$archive" > "$tmp.sha256"
+    mv -f -- "$tmp" "$DEST/$archive"
+    mv -f -- "$tmp.sha256" "$DEST/$archive.sha256"
+    sync -- "$DEST/$archive" "$DEST/$archive.sha256" 2>/dev/null || true
+
+    size="$(stat -c %s -- "$DEST/$archive")"
+    elapsed=$(( SECONDS - start ))
+    lst_log INFO "created $archive ($(lst_fmt_bytes "$size") in ${elapsed}s, sha256 ${hash:0:16}…)"
+}
+
+do_prune() {
+    local -a archives=()
+    local -A keep=()
+    local rule limit last key archive kept=0 deleted=0
+
+    mapfile -t archives < <(list_archives)
+    for rule in daily weekly monthly; do
+        case "$rule" in
+            daily)   limit=$KEEP_DAILY ;;
+            weekly)  limit=$KEEP_WEEKLY ;;
+            monthly) limit=$KEEP_MONTHLY ;;
+        esac
+        last=''
+        for archive in "${archives[@]}"; do
+            (( limit > 0 )) || break
+            key="$(period_key "$rule" "$(archive_ts "$archive")")"
+            [[ "$key" != "$last" ]] || continue
+            last="$key"
+            [[ -z "${keep[$archive]:-}" ]] || continue
+            keep[$archive]=$rule
+            limit=$(( limit - 1 ))
+        done
+    done
+
+    for archive in "${archives[@]}"; do
+        if [[ -n "${keep[$archive]:-}" ]]; then
+            kept=$(( kept + 1 ))
+        else
+            remove "$archive"
+            deleted=$(( deleted + 1 ))
+        fi
+    done
+    lst_log INFO "retention (${KEEP_DAILY}d/${KEEP_WEEKLY}w/${KEEP_MONTHLY}m): kept ${kept}, deleted ${deleted}"
+}
+
+do_verify() {
+    local -a archives=()
+    local archive good=0 bad=0
+    mapfile -t archives < <(list_archives)
+
+    for archive in "${archives[@]}"; do
+        if [[ ! -f "$DEST/$archive.sha256" ]]; then
+            lst_log ERROR "$archive: missing checksum file"
+        elif ! (cd -- "$DEST" && sha256sum --quiet --check -- "$archive.sha256") >/dev/null 2>&1; then
+            lst_log ERROR "$archive: checksum mismatch"
+        elif [[ "$archive" == *.zst ]] && ! command -v zstd >/dev/null 2>&1; then
+            lst_log WARN "$archive: checksum OK; zstd not installed, stream not tested"
+            good=$(( good + 1 ))
+            continue
+        elif ! test_compression "$DEST/$archive" 2>/dev/null; then
+            lst_log ERROR "$archive: corrupt compression stream"
+        else
+            lst_log INFO "$archive: OK"
+            good=$(( good + 1 ))
+            continue
+        fi
+        bad=$(( bad + 1 ))
+    done
+
+    lst_log INFO "verified ${#archives[@]} archive(s): ${good} OK, ${bad} failed"
+    (( bad == 0 ))
+}
+
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
+
+if [[ ! -d "$DEST" ]]; then
+    [[ "$MODE" == backup ]] || lst_die "backup directory does not exist: $DEST"
+    if (( DRY_RUN )); then
+        lst_log INFO "would create directory $DEST"
+    else
+        mkdir -p -- "$DEST"    # 0700 via umask 077
+    fi
+fi
+
+if [[ "$MODE" == verify ]]; then
+    do_verify
+    exit
+fi
+
+# Serialize runs per archive name so a manual run cannot race the timer.
+if (( ! DRY_RUN )); then
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>> "$DEST/.${NAME}.lock"
+        flock -n 9 || lst_die "another ${LST_PROG} run for '${NAME}' holds the lock"
+    else
+        lst_log WARN "flock not found; running without a lock"
+    fi
+    # Leftovers from an interrupted run (safe to remove now that we hold the lock).
+    rm -f -- "$DEST/.${NAME}_"*.partial "$DEST/.${NAME}_"*.partial.sha256
+fi
+
+if [[ "$MODE" == backup ]]; then
+    do_backup
+fi
+if (( PRUNE )); then
+    do_prune
+fi
+exit 0

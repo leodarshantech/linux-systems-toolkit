@@ -1,0 +1,43 @@
+[Unit]
+Description=Compressed, checksummed backup with GFS retention
+Documentation=https://github.com/leodarshantech/linux-systems-toolkit
+RequiresMountsFor=/var/backups
+
+[Service]
+Type=oneshot
+# Defaults; override them in /etc/sys-backup-rotate.conf.
+Environment=BACKUP_DEST=/var/backups/sys-backup-rotate BACKUP_SOURCES=/etc BACKUP_OPTS=
+EnvironmentFile=-/etc/sys-backup-rotate.conf
+ExecStart=/usr/local/bin/sys-backup-rotate --dest ${BACKUP_DEST} $BACKUP_OPTS $BACKUP_SOURCES
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+
+# --- Least privilege ---------------------------------------------------------
+# Runs as root to read every file, but keeps only the capability that bypasses
+# read permission checks. It cannot write outside ReadWritePaths.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Archive directory; for a destination elsewhere add a drop-in:
+#   systemctl edit sys-backup-rotate.service  ->  [Service] ReadWritePaths=/srv/backup
+ReadWritePaths=/var/backups
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
