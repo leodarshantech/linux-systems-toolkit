@@ -1,0 +1,13 @@
+# Local personal planning and strategy documents (not tracked in git)
+JAPAN_CAREER_STRATEGY.md
+*.local.md
+local/
+
+# Temporary files and logs
+*.log
+tmp/
+.cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
