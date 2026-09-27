@@ -1,0 +1,431 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# sys-cis-audit — read-only server hardening audit aligned with CIS Level 1
+#
+# Checks SSH daemon settings, kernel/network sysctls, temporary filesystem
+# mount options, critical file permissions, account hygiene and baseline
+# services. It never changes the system: every check only reads state.
+#
+# Check IDs are this toolkit's own; each maps to a CIS Distribution
+# Independent Linux / RHEL / Ubuntu Level 1 server recommendation, whose
+# numbering differs between benchmarks and releases.
+#
+# Part of linux-systems-toolkit: https://github.com/leodarshantech/linux-systems-toolkit
+# Author: Leo Darshan (@leodarshantech)
+# License: MIT
+# ==============================================================================
+
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+for lib in "${self%/*}/../lib/common.sh" "${self%/*}/../lib/linux-systems-toolkit/common.sh"; do
+    if [[ -r "$lib" ]]; then
+        # shellcheck source=../lib/common.sh
+        . "$lib"
+        break
+    fi
+done
+[[ -n "${LST_VERSION:-}" ]] || { echo "${0##*/}: cannot find lib/common.sh" >&2; exit 3; }
+
+JSON=0
+QUIET=0
+COLOR=1
+declare -A WAIVED=()
+
+usage() {
+    cat <<EOF
+Usage: ${LST_PROG} [OPTIONS]
+
+Read-only hardening audit aligned with CIS Benchmark Level 1 (server).
+Run as root for complete results; checks that need privileges are skipped.
+
+Options:
+  -j, --json          Print one JSON document on a single line
+  -q, --quiet         Print nothing; only set the exit status
+      --no-color      Disable colored output (NO_COLOR is also honored)
+  -s, --skip IDS      Comma-separated check IDs to waive, e.g. NET-01 on a
+                      router or Kubernetes node that must forward packets
+  -v, --version       Print version and exit
+  -h, --help          Print this help and exit
+
+Exit status:
+  0 all checks passed    1 at least one check failed    3 usage or internal error
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)    usage; exit 0 ;;
+        -v|--version) echo "${LST_PROG} ${LST_VERSION}"; exit 0 ;;
+        -j|--json)    JSON=1 ;;
+        -q|--quiet)   QUIET=1 ;;
+        --no-color)   COLOR=0 ;;
+        -s|--skip)
+            lst_need_arg "$@"
+            IFS=, read -ra ids <<< "$2"
+            for id in "${ids[@]}"; do WAIVED[${id^^}]=1; done
+            shift
+            ;;
+        *) lst_usage_error "unknown option '$1'" ;;
+    esac
+    shift
+done
+
+lst_colors "$COLOR"
+
+# Files must be owned by whoever owns the filesystem root: uid 0 on a real
+# system, the test user when LST_ROOT points at a fixture tree.
+ROOT_UID="$(stat -c %u -- "${LST_ROOT:-/}")"
+
+C_ID=() C_SECTION=() C_TITLE=() C_STATUS=() C_DETAIL=()
+
+# record <id> <section> <title> <PASS|FAIL|SKIP> <detail>
+record() {
+    local status="$4" detail="$5"
+    if [[ -n "${WAIVED[$1]:-}" ]]; then
+        status=SKIP detail="waived with --skip ($detail)"
+    fi
+    C_ID+=("$1") C_SECTION+=("$2") C_TITLE+=("$3") C_STATUS+=("$status") C_DETAIL+=("$detail")
+}
+
+# ==============================================================================
+# SSH daemon
+# ==============================================================================
+
+declare -A SSHD=()
+SSHD_SOURCE=''
+
+# parse_sshd_file <file>: first value wins (sshd_config(5)); Include is
+# expanded in place; a Match block ends the global section of that file.
+parse_sshd_file() {
+    local file="$1" line key value pattern inc
+    local -a patterns includes
+    # "Keyword value" or "Keyword=value"; comments only at line start.
+    local re='^[[:space:]]*([A-Za-z]+)[[:space:]]*=?[[:space:]]*(.*[^[:space:]])[[:space:]]*$'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ "$line" =~ $re ]] || continue
+        key="${BASH_REMATCH[1],,}"
+        value="${BASH_REMATCH[2]}"
+        value="${value%\"}"
+        value="${value#\"}"
+        case "$key" in
+            match) return 0 ;;
+            include)
+                read -ra patterns <<< "$value"
+                for pattern in "${patterns[@]}"; do
+                    [[ "$pattern" == /* ]] || pattern="/etc/ssh/$pattern"
+                    mapfile -t includes < <(compgen -G "${LST_ROOT}${pattern}" | sort)
+                    for inc in "${includes[@]}"; do
+                        [[ -r "$inc" ]] && parse_sshd_file "$inc"
+                    done
+                done
+                ;;
+            *) [[ -v "SSHD[$key]" ]] || SSHD[$key]="${value,,}" ;;
+        esac
+    done < "$file"
+}
+
+load_sshd() {
+    local key value out config="${LST_ROOT}/etc/ssh/sshd_config"
+    # `sshd -T` prints the effective configuration, but needs root.
+    if [[ -z "$LST_ROOT" && $EUID -eq 0 ]] && command -v sshd >/dev/null 2>&1 \
+        && out="$(sshd -T 2>/dev/null)"; then
+        while read -r key value; do SSHD[$key]="${value,,}"; done <<< "$out"
+        SSHD_SOURCE='sshd -T'
+        return 0
+    fi
+    [[ -r "$config" ]] || return 1
+    parse_sshd_file "$config"
+    SSHD_SOURCE='sshd_config (parsed)'
+    # OpenSSH compiled-in defaults for anything not set explicitly.
+    local -A defaults=(
+        [permitrootlogin]=prohibit-password [permitemptypasswords]=no
+        [maxauthtries]=6 [ignorerhosts]=yes [hostbasedauthentication]=no
+        [logingracetime]=120 [loglevel]=info [clientaliveinterval]=0
+    )
+    for key in "${!defaults[@]}"; do
+        [[ -v "SSHD[$key]" ]] || SSHD[$key]="${defaults[$key]}"
+    done
+}
+
+# seconds <sshd time>: 90, 1m, 1m30s → seconds.
+seconds() {
+    local spec="$1" total=0 num unit
+    [[ "$spec" =~ ^[0-9]+$ ]] && { echo "$spec"; return; }
+    while [[ "$spec" =~ ^([0-9]+)([smhdw])(.*)$ ]]; do
+        num="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}" spec="${BASH_REMATCH[3]}"
+        case "$unit" in
+            s) total=$(( total + num )) ;;
+            m) total=$(( total + num * 60 )) ;;
+            h) total=$(( total + num * 3600 )) ;;
+            d) total=$(( total + num * 86400 )) ;;
+            w) total=$(( total + num * 604800 )) ;;
+        esac
+    done
+    echo "$total"
+}
+
+# ssh_check <id> <title> <keyword> <rule>
+#   rule: a literal value ("no"), "a|b" for alternatives, "<=N" or ">0".
+ssh_check() {
+    local v="${SSHD[$3]:-}" rule="$4" status=FAIL
+    case "$rule" in
+        '<='*) lst_is_uint "$v" && (( 10#$v <= ${rule#<=} )) && status=PASS ;;
+        '>0')  lst_is_uint "$v" && (( 10#$v > 0 )) && status=PASS ;;
+        *)     [[ "|$rule|" == *"|$v|"* ]] && status=PASS ;;
+    esac
+    record "$1" ssh "$2" "$status" "$3 = ${v:-unset}"
+}
+
+check_ssh() {
+    local id grace
+    if ! load_sshd; then
+        for id in SSH-01 SSH-02 SSH-03 SSH-04 SSH-05 SSH-06 SSH-07 SSH-08; do
+            record "$id" ssh 'OpenSSH server settings' SKIP 'sshd_config not found or not readable'
+        done
+        return
+    fi
+    ssh_check SSH-01 'Root login disabled'             permitrootlogin         no
+    ssh_check SSH-02 'Empty passwords rejected'        permitemptypasswords    no
+    ssh_check SSH-03 'MaxAuthTries is 4 or less'       maxauthtries            '<=4'
+    ssh_check SSH-04 'IgnoreRhosts enabled'            ignorerhosts            yes
+    ssh_check SSH-05 'Host-based auth disabled'        hostbasedauthentication no
+    grace="$(seconds "${SSHD[logingracetime]:-120}")"
+    record SSH-06 ssh 'LoginGraceTime 1-60 seconds' \
+        "$( (( grace >= 1 && grace <= 60 )) && echo PASS || echo FAIL)" "logingracetime = ${grace}s"
+    ssh_check SSH-07 'LogLevel INFO or VERBOSE'        loglevel                'info|verbose'
+    ssh_check SSH-08 'Idle session timeout configured' clientaliveinterval     '>0'
+}
+
+# ==============================================================================
+# Kernel & network parameters
+# ==============================================================================
+
+# sysctl_check <id> <title> <expected> <key>...: every key must equal expected.
+sysctl_check() {
+    local id="$1" title="$2" want="$3" key path value bad='' seen=''
+    shift 3
+    for key in "$@"; do
+        path="${LST_ROOT}/proc/sys/${key//.//}"
+        if [[ ! -r "$path" ]]; then
+            record "$id" kernel "$title" SKIP "$key not present on this kernel"
+            return
+        fi
+        read -r value < "$path"
+        seen+="${seen:+, }${key}=${value}"
+        [[ "$value" == "$want" ]] || bad=1
+    done
+    record "$id" kernel "$title" "$( [[ -z "$bad" ]] && echo PASS || echo FAIL)" "$seen (want $want)"
+}
+
+check_kernel() {
+    sysctl_check KRN-01 'Full ASLR enabled'                 2 kernel.randomize_va_space
+    sysctl_check KRN-02 'SUID core dumps disabled'          0 fs.suid_dumpable
+    sysctl_check NET-01 'IP forwarding disabled'            0 net.ipv4.ip_forward
+    sysctl_check NET-02 'ICMP redirects not sent'           0 net.ipv4.conf.all.send_redirects net.ipv4.conf.default.send_redirects
+    sysctl_check NET-03 'ICMP redirects not accepted'       0 net.ipv4.conf.all.accept_redirects net.ipv4.conf.default.accept_redirects
+    sysctl_check NET-04 'Source-routed packets rejected'    0 net.ipv4.conf.all.accept_source_route net.ipv4.conf.default.accept_source_route
+    sysctl_check NET-05 'Martian packets logged'            1 net.ipv4.conf.all.log_martians net.ipv4.conf.default.log_martians
+    sysctl_check NET-06 'Broadcast ICMP ignored'            1 net.ipv4.icmp_echo_ignore_broadcasts
+    sysctl_check NET-07 'TCP SYN cookies enabled'           1 net.ipv4.tcp_syncookies
+    sysctl_check NET-08 'Strict reverse-path filtering'     1 net.ipv4.conf.all.rp_filter net.ipv4.conf.default.rp_filter
+    sysctl_check NET-09 'IPv6 router advertisements ignored' 0 net.ipv6.conf.all.accept_ra net.ipv6.conf.default.accept_ra
+}
+
+# ==============================================================================
+# Filesystems
+# ==============================================================================
+
+# mount_opts <mountpoint>: options of the topmost mount at that path.
+mount_opts() {
+    awk -v m="$1" '$2 == m { opts = $4 } END { if (opts != "") print opts }' "${LST_ROOT}/proc/mounts"
+}
+
+# mount_check <id> <mountpoint>: nodev, nosuid and noexec must all be set.
+mount_check() {
+    local opts missing='' opt
+    opts="$(mount_opts "$2")"
+    if [[ -z "$opts" ]]; then
+        record "$1" filesystem "$2 nodev,nosuid,noexec" SKIP "$2 is not a separate mount"
+        return
+    fi
+    for opt in nodev nosuid noexec; do
+        [[ ",$opts," == *",$opt,"* ]] || missing+="${missing:+,}$opt"
+    done
+    if [[ -z "$missing" ]]; then
+        record "$1" filesystem "$2 nodev,nosuid,noexec" PASS 'all options set'
+    else
+        record "$1" filesystem "$2 nodev,nosuid,noexec" FAIL "missing: $missing"
+    fi
+}
+
+check_filesystems() {
+    if [[ -n "$(mount_opts /tmp)" ]]; then
+        record FS-01 filesystem '/tmp is a separate filesystem' PASS "$(awk '$2 == "/tmp" { t = $3 } END { print t }' "${LST_ROOT}/proc/mounts")"
+    else
+        record FS-01 filesystem '/tmp is a separate filesystem' FAIL '/tmp lives on the root filesystem'
+    fi
+    mount_check FS-02 /tmp
+    mount_check FS-03 /dev/shm
+}
+
+# ==============================================================================
+# File permissions
+# ==============================================================================
+
+# perm_check <id> <path> <max octal mode>: owned by root, no bits beyond max.
+perm_check() {
+    local id="$1" path="$2" max="$3" mode uid
+    if [[ ! -e "${LST_ROOT}${path}" ]]; then
+        record "$id" files "$path mode <= $max" SKIP 'file not present'
+        return
+    fi
+    read -r mode uid < <(stat -c '%a %u' -- "${LST_ROOT}${path}")
+    if (( (8#$mode & ~8#$max) == 0 && uid == ROOT_UID )); then
+        record "$id" files "$path mode <= $max" PASS "mode $mode, uid $uid"
+    else
+        record "$id" files "$path mode <= $max" FAIL "mode $mode, uid $uid (want <= $max, root-owned)"
+    fi
+}
+
+check_files() {
+    perm_check FILE-01 /etc/passwd          644
+    perm_check FILE-02 /etc/group           644
+    perm_check FILE-03 /etc/shadow          640
+    perm_check FILE-04 /etc/gshadow         640
+    perm_check FILE-05 /etc/ssh/sshd_config 600
+    perm_check FILE-06 /etc/crontab         600
+}
+
+# ==============================================================================
+# Accounts
+# ==============================================================================
+
+check_accounts() {
+    local uid0 empty shadow="${LST_ROOT}/etc/shadow"
+    uid0="$(awk -F: '$3 == 0 { printf "%s%s", sep, $1; sep = "," }' "${LST_ROOT}/etc/passwd")"
+    if [[ "$uid0" == root ]]; then
+        record ACC-01 accounts 'Only root has UID 0' PASS 'root'
+    else
+        record ACC-01 accounts 'Only root has UID 0' FAIL "UID 0 accounts: ${uid0:-none}"
+    fi
+
+    if [[ ! -r "$shadow" ]]; then
+        record ACC-02 accounts 'No accounts with empty passwords' SKIP '/etc/shadow not readable (run as root)'
+        return
+    fi
+    empty="$(awk -F: '$2 == "" { printf "%s%s", sep, $1; sep = "," }' "$shadow")"
+    if [[ -z "$empty" ]]; then
+        record ACC-02 accounts 'No accounts with empty passwords' PASS 'none'
+    else
+        record ACC-02 accounts 'No accounts with empty passwords' FAIL "empty: $empty"
+    fi
+}
+
+# ==============================================================================
+# Services
+# ==============================================================================
+
+# active_unit <unit>...: print the first active unit.
+active_unit() {
+    local unit
+    for unit in "$@"; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            echo "$unit"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_services() {
+    local unit
+    if ! lst_systemd_booted; then
+        record SVC-01 services 'Host firewall active' SKIP 'systemd is not PID 1'
+        record SVC-02 services 'Time synchronization active' SKIP 'systemd is not PID 1'
+        return
+    fi
+    if unit="$(active_unit firewalld ufw nftables iptables)"; then
+        record SVC-01 services 'Host firewall active' PASS "$unit"
+    else
+        record SVC-01 services 'Host firewall active' FAIL 'none of firewalld, ufw, nftables, iptables is active'
+    fi
+    if unit="$(active_unit chronyd chrony systemd-timesyncd ntpd ntpsec)"; then
+        record SVC-02 services 'Time synchronization active' PASS "$unit"
+    else
+        record SVC-02 services 'Time synchronization active' FAIL 'no chrony, timesyncd or ntpd running'
+    fi
+}
+
+check_ssh
+check_kernel
+check_filesystems
+check_files
+check_accounts
+check_services
+
+PASSED=0 FAILED=0 SKIPPED=0
+for s in "${C_STATUS[@]}"; do
+    case "$s" in
+        PASS) PASSED=$(( PASSED + 1 )) ;;
+        FAIL) FAILED=$(( FAILED + 1 )) ;;
+        SKIP) SKIPPED=$(( SKIPPED + 1 )) ;;
+    esac
+done
+SCORED=$(( PASSED + FAILED ))
+SCORE=0
+(( SCORED == 0 )) || SCORE=$(( PASSED * 100 / SCORED ))
+EXIT_CODE=0
+(( FAILED == 0 )) || EXIT_CODE=1
+
+(( QUIET )) && exit "$EXIT_CODE"
+
+render_json() {
+    local i checks=()
+    for i in "${!C_ID[@]}"; do
+        checks+=("$(printf '{"id":"%s","section":"%s","title":%s,"status":"%s","detail":%s}' \
+            "${C_ID[i]}" "${C_SECTION[i]}" "$(lst_json_str "${C_TITLE[i]}")" \
+            "${C_STATUS[i]}" "$(lst_json_str "${C_DETAIL[i]}")")")
+    done
+    printf '{"tool":"sys-cis-audit","version":"%s","timestamp":"%s","hostname":%s,"profile":"CIS Level 1 Server (aligned)","sshd_source":%s,"summary":{"passed":%s,"failed":%s,"skipped":%s,"score_pct":%s},"exit_code":%s,"checks":%s}\n' \
+        "$LST_VERSION" "$(lst_timestamp)" "$(lst_json_str "$(lst_hostname)")" \
+        "$(lst_json_str "${SSHD_SOURCE:-none}")" "$PASSED" "$FAILED" "$SKIPPED" "$SCORE" \
+        "$EXIT_CODE" "$(lst_json_join "${checks[@]}")"
+}
+
+render_text() {
+    local i section='' heading
+    lst_header 'CIS LEVEL 1 HARDENING AUDIT (READ-ONLY)'
+    printf 'Host: %s%s%s | Running as: %s | SSH config: %s\n' \
+        "$C_CYAN" "$(lst_hostname)" "$C_RESET" "$( (( EUID == 0 )) && echo root || echo "uid $EUID (some checks skipped)")" \
+        "${SSHD_SOURCE:-n/a}"
+    for i in "${!C_ID[@]}"; do
+        if [[ "${C_SECTION[i]}" != "$section" ]]; then
+            section="${C_SECTION[i]}"
+            case "$section" in
+                ssh)        heading='SSH Server' ;;
+                kernel)     heading='Kernel & Network Parameters' ;;
+                filesystem) heading='Filesystems' ;;
+                files)      heading='File Permissions' ;;
+                accounts)   heading='Accounts' ;;
+                services)   heading='Services' ;;
+            esac
+            printf '\n%s%s%s\n' "$C_BOLD" "$heading" "$C_RESET"
+        fi
+        printf '%s %-8s %-36s %s%s%s\n' "$(lst_badge "${C_STATUS[i]}")" "${C_ID[i]}" \
+            "${C_TITLE[i]}" "$C_DIM" "${C_DETAIL[i]}" "$C_RESET"
+    done
+    echo
+    lst_rule '-'
+    printf 'Score: %s%d%%%s (%d passed, %d failed, %d skipped)\n' \
+        "$C_BOLD" "$SCORE" "$C_RESET" "$PASSED" "$FAILED" "$SKIPPED"
+    lst_rule '='
+}
+
+if (( JSON )); then
+    render_json
+else
+    render_text
+fi
+exit "$EXIT_CODE"
