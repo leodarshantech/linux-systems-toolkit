@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck & Utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck python3
+
+      - name: Run ShellCheck Linting
+        run: |
+          shellcheck bin/* tests/*.sh
+
+      - name: Run Automated Test Suite
+        run: |
+          make test
+
+      - name: Test Systemd Unit Syntax
+        run: |
+          systemd-analyze verify systemd/*.service systemd/*.timer || true

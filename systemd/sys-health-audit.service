@@ -1,0 +1,30 @@
+[Unit]
+Description=Linux Systems Health & Security Posture Audit
+Documentation=https://github.com/leodarshantech/linux-systems-toolkit
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sys-health-audit --quiet
+StandardOutput=journal
+StandardError=journal
+
+# ==============================================================================
+# Security & Process Sandboxing Hardening
+# ==============================================================================
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+# Capabilities required for low-level inspection
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
+
+[Install]
+WantedBy=multi-user.target

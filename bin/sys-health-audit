@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# sys-health-audit
+# Production-grade Linux System Health & Security Posture Auditor
+#
+# Part of linux-systems-toolkit
+# Author: Leo Darshan (@leodarshantech)
+# License: MIT
+# ==============================================================================
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Default Thresholds
+CPU_WARN_PCT=80
+CPU_CRIT_PCT=90
+MEM_WARN_PCT=85
+MEM_CRIT_PCT=95
+SWAP_WARN_PCT=75
+DISK_WARN_PCT=85
+DISK_CRIT_PCT=95
+INODE_WARN_PCT=85
+INODE_CRIT_PCT=95
+
+# Flags
+JSON_MODE=0
+QUIET_MODE=0
+USE_COLOR=1
+
+# Check if stdout is a TTY
+if [[ ! -t 1 ]] || [[ -n "${NO_COLOR:-}" ]]; then
+    USE_COLOR=0
+fi
+
+# Exit Status Trackers
+# 0 = OK, 1 = WARNING, 2 = CRITICAL
+OVERALL_STATUS=0
+
+update_status() {
+    local level="$1"
+    if [[ "$level" == "CRIT" ]] && [[ "$OVERALL_STATUS" -lt 2 ]]; then
+        OVERALL_STATUS=2
+    elif [[ "$level" == "WARN" ]] && [[ "$OVERALL_STATUS" -lt 1 ]]; then
+        OVERALL_STATUS=1
+    fi
+}
+
+# Colors
+if [[ "$USE_COLOR" -eq 1 ]]; then
+    CLR_RESET="\033[0m"
+    CLR_BOLD="\033[1m"
+    CLR_GREEN="\033[32m"
+    CLR_YELLOW="\033[33m"
+    CLR_RED="\033[31m"
+    CLR_CYAN="\033[36m"
+    CLR_DIM="\033[2m"
+else
+    CLR_RESET=""
+    CLR_BOLD=""
+    CLR_GREEN=""
+    CLR_YELLOW=""
+    CLR_RED=""
+    CLR_CYAN=""
+    CLR_DIM=""
+fi
+
+show_help() {
+    cat <<EOF
+sys-health-audit v${VERSION}
+High-precision Linux system diagnostic & health monitoring auditor.
+
+USAGE:
+    sys-health-audit [OPTIONS]
+
+OPTIONS:
+    -j, --json               Output report in machine-readable JSON format
+    -q, --quiet              Suppress standard output; only return exit status code
+        --no-color           Disable colored terminal output
+    -c, --cpu <pct>          CPU warning threshold percentage (default: ${CPU_WARN_PCT})
+    -m, --mem <pct>          Memory warning threshold percentage (default: ${MEM_WARN_PCT})
+    -d, --disk <pct>         Disk usage warning threshold percentage (default: ${DISK_WARN_PCT})
+    -i, --inode <pct>        Inode warning threshold percentage (default: ${INODE_WARN_PCT})
+    -v, --version            Display version information
+    -h, --help               Display this help text
+
+EXIT CODES:
+    0    All systems healthy (OK)
+    1    At least one warning detected (WARN)
+    2    At least one critical threshold exceeded or failed service (CRIT)
+
+EXAMPLES:
+    sys-health-audit
+    sys-health-audit --json
+    sys-health-audit --disk 80 --mem 80
+EOF
+}
+
+# Parse Command-Line Options
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--version)
+            echo "sys-health-audit v${VERSION}"
+            exit 0
+            ;;
+        -j|--json)
+            JSON_MODE=1
+            shift
+            ;;
+        -q|--quiet)
+            QUIET_MODE=1
+            shift
+            ;;
+        --no-color)
+            USE_COLOR=0
+            CLR_RESET=""
+            CLR_BOLD=""
+            CLR_GREEN=""
+            CLR_YELLOW=""
+            CLR_RED=""
+            CLR_CYAN=""
+            CLR_DIM=""
+            shift
+            ;;
+        -c|--cpu)
+            CPU_WARN_PCT="$2"
+            shift 2
+            ;;
+        -m|--mem)
+            MEM_WARN_PCT="$2"
+            shift 2
+            ;;
+        -d|--disk)
+            DISK_WARN_PCT="$2"
+            shift 2
+            ;;
+        -i|--inode)
+            INODE_WARN_PCT="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            show_help >&2
+            exit 2
+            ;;
+    esac
+done
+
+# ==============================================================================
+# Metric Collection Functions
+# ==============================================================================
+
+# 1. System Info & Uptime
+HOSTNAME="$(cat /proc/sys/kernel/hostname 2>/dev/null || hostname)"
+KERNEL="$(uname -r)"
+UPTIME_SECS="$(awk '{print int($1)}' /proc/uptime)"
+UPTIME_DAYS=$((UPTIME_SECS / 86400))
+UPTIME_HOURS=$(((UPTIME_SECS % 86400) / 3600))
+UPTIME_MINS=$(((UPTIME_SECS % 3600) / 60))
+
+# 2. CPU & Load Average
+CPU_CORES="$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo || echo 1)"
+read -r LOAD_1 LOAD_5 LOAD_15 _ < /proc/loadavg
+# Calculate normalized load percentage on 15m load
+LOAD_PCT="$(awk -v l="$LOAD_15" -v c="$CPU_CORES" 'BEGIN { printf "%.0f", (l / c) * 100 }')"
+
+CPU_STATUS="OK"
+if [[ "$LOAD_PCT" -ge "$CPU_CRIT_PCT" ]]; then
+    CPU_STATUS="CRIT"
+    update_status "CRIT"
+elif [[ "$LOAD_PCT" -ge "$CPU_WARN_PCT" ]]; then
+    CPU_STATUS="WARN"
+    update_status "WARN"
+fi
+
+# 3. Memory & Swap Calculation (from /proc/meminfo in KiB)
+MEM_TOTAL=0
+MEM_AVAIL=0
+SWAP_TOTAL=0
+SWAP_FREE=0
+
+while read -r key val _; do
+    case "$key" in
+        MemTotal:) MEM_TOTAL="$val" ;;
+        MemAvailable:) MEM_AVAIL="$val" ;;
+        SwapTotal:) SWAP_TOTAL="$val" ;;
+        SwapFree:) SWAP_FREE="$val" ;;
+    esac
+done < /proc/meminfo
+
+MEM_USED=$((MEM_TOTAL - MEM_AVAIL))
+MEM_PCT="$(awk -v u="$MEM_USED" -v t="$MEM_TOTAL" 'BEGIN { if (t > 0) printf "%.1f", (u / t) * 100; else print "0" }')"
+MEM_PCT_INT="${MEM_PCT%.*}"
+
+MEM_STATUS="OK"
+if [[ "$MEM_PCT_INT" -ge "$MEM_CRIT_PCT" ]]; then
+    MEM_STATUS="CRIT"
+    update_status "CRIT"
+elif [[ "$MEM_PCT_INT" -ge "$MEM_WARN_PCT" ]]; then
+    MEM_STATUS="WARN"
+    update_status "WARN"
+fi
+
+SWAP_USED=$((SWAP_TOTAL - SWAP_FREE))
+if [[ "$SWAP_TOTAL" -gt 0 ]]; then
+    SWAP_PCT="$(awk -v u="$SWAP_USED" -v t="$SWAP_TOTAL" 'BEGIN { printf "%.1f", (u / t) * 100 }')"
+    SWAP_PCT_INT="${SWAP_PCT%.*}"
+else
+    SWAP_PCT="0.0"
+    SWAP_PCT_INT=0
+fi
+
+SWAP_STATUS="OK"
+if [[ "$SWAP_PCT_INT" -ge "$SWAP_WARN_PCT" ]]; then
+    SWAP_STATUS="WARN"
+    update_status "WARN"
+fi
+
+# 4. Disk & Inode Auditing
+# Scans real filesystems (ext4, xfs, btrfs, f2fs, zfs)
+declare -a DISK_RESULTS=()
+declare -a INODE_RESULTS=()
+DISK_STATUS="OK"
+INODE_STATUS="OK"
+
+while read -r fs fstype size used avail pct mount; do
+    # Remove % sign
+    pct_val="${pct%\%}"
+    if [[ "$pct_val" -ge "$DISK_CRIT_PCT" ]]; then
+        DISK_STATUS="CRIT"
+        update_status "CRIT"
+    elif [[ "$pct_val" -ge "$DISK_WARN_PCT" ]]; then
+        if [[ "$DISK_STATUS" != "CRIT" ]]; then DISK_STATUS="WARN"; fi
+        update_status "WARN"
+    fi
+    DISK_RESULTS+=("{\"filesystem\":\"$fs\",\"mount\":\"$mount\",\"type\":\"$fstype\",\"size\":\"$size\",\"used\":\"$used\",\"avail\":\"$avail\",\"pct\":$pct_val}")
+done < <(df -PT -t ext4 -t xfs -t btrfs -t f2fs -t zfs 2>/dev/null | awk 'NR>1 {print $1, $2, $3, $4, $5, $6, $7}')
+
+while read -r fs inodes iused ifree ipct mount; do
+    ipct_val="${ipct%\%}"
+    if [[ "$ipct_val" =~ ^[0-9]+$ ]]; then
+        if [[ "$ipct_val" -ge "$INODE_CRIT_PCT" ]]; then
+            INODE_STATUS="CRIT"
+            update_status "CRIT"
+        elif [[ "$ipct_val" -ge "$INODE_WARN_PCT" ]]; then
+            if [[ "$INODE_STATUS" != "CRIT" ]]; then INODE_STATUS="WARN"; fi
+            update_status "WARN"
+        fi
+        INODE_RESULTS+=("{\"mount\":\"$mount\",\"inodes\":$inodes,\"used\":$iused,\"free\":$ifree,\"pct\":$ipct_val}")
+    fi
+done < <(df -Pi -t ext4 -t xfs -t btrfs -t f2fs -t zfs 2>/dev/null | awk 'NR>1 {print $1, $2, $3, $4, $5, $6}')
+
+# 5. Systemd Failed Units
+FAILED_UNITS_COUNT=0
+FAILED_UNITS_LIST=""
+SYSTEMD_STATUS="OK"
+
+if command -v systemctl &>/dev/null; then
+    # List failed units without pager
+    FAILED_SERVICES="$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "$FAILED_SERVICES" ]]; then
+        FAILED_UNITS_COUNT="$(echo "$FAILED_SERVICES" | grep -c . || echo 0)"
+        FAILED_UNITS_LIST="$(echo "$FAILED_SERVICES" | tr '\n' ',' | sed 's/,$//')"
+        SYSTEMD_STATUS="CRIT"
+        update_status "CRIT"
+    fi
+fi
+
+# 6. Zombie / Defunct Processes
+ZOMBIE_COUNT="$(awk '$3=="Z" {c++} END {print c+0}' /proc/[0-9]*/stat 2>/dev/null || echo 0)"
+ZOMBIE_STATUS="OK"
+if [[ "$ZOMBIE_COUNT" -gt 0 ]]; then
+    ZOMBIE_STATUS="WARN"
+    update_status "WARN"
+fi
+
+# 7. Security: Failed SSH Login Attempts (Past 24 Hours)
+FAILED_SSH_COUNT=0
+if command -v journalctl &>/dev/null; then
+    FAILED_SSH_COUNT="$(journalctl -u sshd -u ssh --since "24 hours ago" --no-pager 2>/dev/null | grep -E -c "Failed password|authentication failure" || true)"
+    if [[ ! "$FAILED_SSH_COUNT" =~ ^[0-9]+$ ]]; then
+        FAILED_SSH_COUNT=0
+    fi
+fi
+
+# ==============================================================================
+# Rendering
+# ==============================================================================
+
+# Helper badge
+render_badge() {
+    local status="$1"
+    case "$status" in
+        OK)
+            echo -e "${CLR_GREEN}[  OK  ]${CLR_RESET}"
+            ;;
+        WARN)
+            echo -e "${CLR_YELLOW}[ WARN ]${CLR_RESET}"
+            ;;
+        CRIT)
+            echo -e "${CLR_RED}${CLR_BOLD}[ CRIT ]${CLR_RESET}"
+            ;;
+    esac
+}
+
+format_kib() {
+    local kib="$1"
+    if [[ "$kib" -ge 1048576 ]]; then
+        awk -v k="$kib" 'BEGIN { printf "%.2f GiB", k / 1048576 }'
+    elif [[ "$kib" -ge 1024 ]]; then
+        awk -v k="$kib" 'BEGIN { printf "%.1f MiB", k / 1024 }'
+    else
+        echo "${kib} KiB"
+    fi
+}
+
+if [[ "$QUIET_MODE" -eq 1 ]]; then
+    exit "$OVERALL_STATUS"
+fi
+
+# --- JSON Output Mode ---
+if [[ "$JSON_MODE" -eq 1 ]]; then
+    TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    
+    # Format Disk and Inode JSON arrays
+    DISK_JSON="$(IFS=,; echo "[${DISK_RESULTS[*]}]")"
+    INODE_JSON="$(IFS=,; echo "[${INODE_RESULTS[*]}]")"
+
+    cat <<EOF
+{
+  "timestamp": "$TIMESTAMP",
+  "hostname": "$HOSTNAME",
+  "kernel": "$KERNEL",
+  "uptime_seconds": $UPTIME_SECS,
+  "overall_status": $(if [[ "$OVERALL_STATUS" -eq 0 ]]; then echo '"OK"'; elif [[ "$OVERALL_STATUS" -eq 1 ]]; then echo '"WARN"'; else echo '"CRIT"'; fi),
+  "exit_code": $OVERALL_STATUS,
+  "metrics": {
+    "cpu": {
+      "cores": $CPU_CORES,
+      "load_1m": $LOAD_1,
+      "load_5m": $LOAD_5,
+      "load_15m": $LOAD_15,
+      "load_normalized_pct": $LOAD_PCT,
+      "status": "$CPU_STATUS"
+    },
+    "memory": {
+      "total_kib": $MEM_TOTAL,
+      "available_kib": $MEM_AVAIL,
+      "used_kib": $MEM_USED,
+      "used_pct": $MEM_PCT,
+      "status": "$MEM_STATUS"
+    },
+    "swap": {
+      "total_kib": $SWAP_TOTAL,
+      "used_kib": $SWAP_USED,
+      "used_pct": $SWAP_PCT,
+      "status": "$SWAP_STATUS"
+    },
+    "disks": $DISK_JSON,
+    "inodes": $INODE_JSON,
+    "systemd": {
+      "failed_units_count": $FAILED_UNITS_COUNT,
+      "failed_units": [$(if [[ -n "$FAILED_UNITS_LIST" ]]; then echo "\"$(echo "$FAILED_UNITS_LIST" | sed 's/,/","/g')\""; fi)],
+      "status": "$SYSTEMD_STATUS"
+    },
+    "processes": {
+      "zombie_count": $ZOMBIE_COUNT,
+      "status": "$ZOMBIE_STATUS"
+    },
+    "security": {
+      "failed_ssh_logins_24h": $FAILED_SSH_COUNT
+    }
+  }
+}
+EOF
+    exit "$OVERALL_STATUS"
+fi
+
+# --- Human-Readable Terminal Mode ---
+echo -e "${CLR_BOLD}==============================================================================${CLR_RESET}"
+echo -e "${CLR_BOLD}                    SYSTEM HEALTH & SECURITY POSTURE AUDIT                    ${CLR_RESET}"
+echo -e "${CLR_BOLD}==============================================================================${CLR_RESET}"
+echo -e "Host: ${CLR_CYAN}${HOSTNAME}${CLR_RESET} | Kernel: ${CLR_CYAN}${KERNEL}${CLR_RESET} | Uptime: ${CLR_CYAN}${UPTIME_DAYS}d ${UPTIME_HOURS}h ${UPTIME_MINS}m${CLR_RESET}"
+echo ""
+
+# CPU
+printf "%-10s %-18s %s\n" \
+    "$(render_badge "$CPU_STATUS")" \
+    "CPU Load" \
+    "1m: ${LOAD_1}, 5m: ${LOAD_5}, 15m: ${LOAD_15} (${CPU_CORES} cores, ~${LOAD_PCT}% load)"
+
+# Memory
+MEM_TOTAL_FMT="$(format_kib "$MEM_TOTAL")"
+MEM_USED_FMT="$(format_kib "$MEM_USED")"
+printf "%-10s %-18s %s\n" \
+    "$(render_badge "$MEM_STATUS")" \
+    "Memory (RAM)" \
+    "${MEM_USED_FMT} / ${MEM_TOTAL_FMT} (${MEM_PCT}% used)"
+
+# Swap
+if [[ "$SWAP_TOTAL" -gt 0 ]]; then
+    SWAP_TOTAL_FMT="$(format_kib "$SWAP_TOTAL")"
+    SWAP_USED_FMT="$(format_kib "$SWAP_USED")"
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "$SWAP_STATUS")" \
+        "Swap Space" \
+        "${SWAP_USED_FMT} / ${SWAP_TOTAL_FMT} (${SWAP_PCT}% used)"
+else
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "OK")" \
+        "Swap Space" \
+        "Disabled / None configured"
+fi
+
+# Disk Mounts
+printf "%-10s %-18s %s\n" \
+    "$(render_badge "$DISK_STATUS")" \
+    "Disk Storage" \
+    "Audited physical filesystems"
+
+while read -r fs fstype size used avail pct mount; do
+    echo -e "           ${CLR_DIM}├─${CLR_RESET} ${mount} (${fstype}): ${used}/${size} (${pct} used)"
+done < <(df -hPT -t ext4 -t xfs -t btrfs -t f2fs -t zfs 2>/dev/null | awk 'NR>1 {print $1, $2, $3, $4, $5, $6, $7}')
+
+# Inodes
+printf "%-10s %-18s %s\n" \
+    "$(render_badge "$INODE_STATUS")" \
+    "Inode Table" \
+    "Audited physical inodes"
+while read -r fs inodes iused ifree ipct mount; do
+    if [[ "$inodes" == "-" ]] || [[ "$inodes" == "0" ]]; then
+        echo -e "           ${CLR_DIM}├─${CLR_RESET} ${mount}: Dynamic allocation (no fixed limit)"
+    else
+        echo -e "           ${CLR_DIM}├─${CLR_RESET} ${mount}: ${iused}/${inodes} inodes (${ipct} used)"
+    fi
+done < <(df -Pi -t ext4 -t xfs -t btrfs -t f2fs -t zfs 2>/dev/null | awk 'NR>1 {print $1, $2, $3, $4, $5, $6}')
+
+# Systemd Units
+if [[ "$FAILED_UNITS_COUNT" -eq 0 ]]; then
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "OK")" \
+        "Systemd Daemons" \
+        "All units active & running normally"
+else
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "CRIT")" \
+        "Systemd Daemons" \
+        "${FAILED_UNITS_COUNT} failed unit(s): ${FAILED_UNITS_LIST}"
+fi
+
+# Zombie Processes
+if [[ "$ZOMBIE_COUNT" -eq 0 ]]; then
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "OK")" \
+        "Process Table" \
+        "0 defunct/zombie processes"
+else
+    printf "%-10s %-18s %s\n" \
+        "$(render_badge "WARN")" \
+        "Process Table" \
+        "${ZOMBIE_COUNT} zombie process(es) detected"
+fi
+
+# Security Log Check
+printf "%-10s %-18s %s\n" \
+    "$(render_badge "OK")" \
+    "Security (SSH)" \
+    "${FAILED_SSH_COUNT} failed login attempt(s) in last 24h"
+
+echo -e "${CLR_BOLD}------------------------------------------------------------------------------${CLR_RESET}"
+if [[ "$OVERALL_STATUS" -eq 0 ]]; then
+    echo -e "Audit Result: ${CLR_GREEN}${CLR_BOLD}SYSTEM IS HEALTHY (EXIT 0)${CLR_RESET}"
+elif [[ "$OVERALL_STATUS" -eq 1 ]]; then
+    echo -e "Audit Result: ${CLR_YELLOW}${CLR_BOLD}WARNINGS DETECTED (EXIT 1)${CLR_RESET}"
+else
+    echo -e "Audit Result: ${CLR_RED}${CLR_BOLD}CRITICAL ISSUES REQUIRING ATTENTION (EXIT 2)${CLR_RESET}"
+fi
+echo -e "${CLR_BOLD}==============================================================================${CLR_RESET}"
+
+exit "$OVERALL_STATUS"
