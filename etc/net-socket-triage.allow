@@ -1,0 +1,15 @@
+# Expected non-loopback listeners for: net-socket-triage --allow FILE
+#
+# Format:  <tcp|udp>  <port>  [process]
+# The process name is compared only when running as root (ss can only show
+# other users' sockets to root); otherwise the port alone must match.
+
+tcp 22   sshd
+
+# Web server
+# tcp 80   nginx
+# tcp 443  nginx
+
+# DHCP client and chrony on typical cloud VMs
+# udp 68   systemd-networkd
+# udp 323  chronyd

@@ -1,0 +1,422 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# net-socket-triage — TCP socket state, listening port and DNS latency triage
+#
+# Answers the first questions of a network incident: are sockets piling up in
+# CLOSE-WAIT / SYN-RECV / TIME-WAIT, is anything listening that should not be,
+# and is name resolution slow or broken?
+#
+# Part of linux-systems-toolkit: https://github.com/leodarshantech/linux-systems-toolkit
+# Author: Leo Darshan (@leodarshantech)
+# License: MIT
+# ==============================================================================
+
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+for lib in "${self%/*}/../lib/common.sh" "${self%/*}/../lib/linux-systems-toolkit/common.sh"; do
+    if [[ -r "$lib" ]]; then
+        # shellcheck source=../lib/common.sh
+        . "$lib"
+        break
+    fi
+done
+[[ -n "${LST_VERSION:-}" ]] || { echo "${0##*/}: cannot find lib/common.sh" >&2; exit 3; }
+
+CLOSE_WAIT_WARN=100
+SYN_RECV_WARN=100
+TIME_WAIT_WARN=50       # % of the ephemeral port range
+DNS_WARN_MS=250
+DNS_NAME=example.com
+RESOLVERS='system,1.1.1.1,8.8.8.8'
+ALLOW_FILE=''
+DNS=1
+JSON=0
+QUIET=0
+COLOR=1
+
+usage() {
+    cat <<EOF
+Usage: ${LST_PROG} [OPTIONS]
+
+Triage TCP socket states, audit listening ports and benchmark DNS resolvers.
+
+Options:
+  -j, --json              Print one JSON document on a single line
+  -q, --quiet             Print nothing; only set the exit status
+      --no-color          Disable colored output (NO_COLOR is also honored)
+  -a, --allow FILE        Allowlist of expected listeners ("tcp 22 sshd" per line);
+                          other non-loopback listeners raise WARN
+      --close-wait N      CLOSE-WAIT sockets that raise WARN   (default: ${CLOSE_WAIT_WARN})
+      --syn-recv N        SYN-RECV sockets that raise WARN     (default: ${SYN_RECV_WARN})
+      --time-wait PCT     TIME-WAIT sockets as % of the ephemeral
+                          port range that raise WARN           (default: ${TIME_WAIT_WARN})
+      --dns-name NAME     Name to resolve                      (default: ${DNS_NAME})
+      --resolvers LIST    Comma-separated resolvers; "system" = /etc/resolv.conf
+                                                               (default: ${RESOLVERS})
+      --dns-warn MS       Latency that raises WARN             (default: ${DNS_WARN_MS})
+      --no-dns            Skip the DNS benchmark
+  -v, --version           Print version and exit
+  -h, --help              Print this help and exit
+
+Run as root to see which process owns every socket.
+
+Exit status (Nagios plugin convention):
+  0 OK    1 WARNING    2 CRITICAL    3 UNKNOWN (usage or internal error)
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)     usage; exit 0 ;;
+        -v|--version)  echo "${LST_PROG} ${LST_VERSION}"; exit 0 ;;
+        -j|--json)     JSON=1 ;;
+        -q|--quiet)    QUIET=1 ;;
+        --no-color)    COLOR=0 ;;
+        -a|--allow)    lst_need_arg "$@"; ALLOW_FILE="$2"; shift ;;
+        --close-wait)  lst_need_arg "$@"; lst_uint "$1" "$2" CLOSE_WAIT_WARN; shift ;;
+        --syn-recv)    lst_need_arg "$@"; lst_uint "$1" "$2" SYN_RECV_WARN; shift ;;
+        --time-wait)   lst_need_arg "$@"; lst_uint "$1" "$2" TIME_WAIT_WARN; shift ;;
+        --dns-name)    lst_need_arg "$@"; DNS_NAME="$2"; shift ;;
+        --resolvers)   lst_need_arg "$@"; RESOLVERS="$2"; shift ;;
+        --dns-warn)    lst_need_arg "$@"; lst_uint "$1" "$2" DNS_WARN_MS; shift ;;
+        --no-dns)      DNS=0 ;;
+        *)             lst_usage_error "unknown option '$1'" ;;
+    esac
+    shift
+done
+
+if [[ -n "$ALLOW_FILE" && ! -r "$ALLOW_FILE" ]]; then
+    lst_usage_error "cannot read allowlist '$ALLOW_FILE'"
+fi
+
+lst_colors "$COLOR"
+STATUS=OK
+command -v ss >/dev/null 2>&1 || { echo "${LST_PROG}: ss (iproute2) is required" >&2; exit 3; }
+
+# ==============================================================================
+# TCP socket states
+# ==============================================================================
+
+# ss state names in display order, and the JSON key for each.
+STATES=(ESTAB SYN-SENT SYN-RECV FIN-WAIT-1 FIN-WAIT-2 TIME-WAIT CLOSE-WAIT LAST-ACK CLOSING LISTEN)
+
+# top_ports <assoc-array-name>: "port\tcount" for the 3 busiest local ports.
+top_ports() {
+    local -n counts_="$1"
+    local port
+    for port in "${!counts_[@]}"; do
+        printf '%s\t%s\n' "$port" "${counts_[$port]}"
+    done | sort -t $'\t' -k2,2nr -k1,1n | head -n 3
+}
+
+check_tcp() {
+    local state local_addr lo hi
+    declare -gA TCP=()
+    local -A cw_ports=() syn_ports=()
+
+    # Columns: State Recv-Q Send-Q Local:Port Peer:Port
+    while read -r state _ _ local_addr _; do
+        TCP[$state]=$(( ${TCP[$state]:-0} + 1 ))
+        case "$state" in
+            CLOSE-WAIT) cw_ports[${local_addr##*:}]=$(( ${cw_ports[${local_addr##*:}]:-0} + 1 )) ;;
+            SYN-RECV)   syn_ports[${local_addr##*:}]=$(( ${syn_ports[${local_addr##*:}]:-0} + 1 )) ;;
+        esac
+    done < <(ss -H -t -a -n 2>/dev/null)
+
+    # CLOSE-WAIT: the peer closed but the local application never called
+    # close() — almost always a socket/file-descriptor leak in that service.
+    CW_COUNT=${TCP[CLOSE-WAIT]:-0}
+    CW_STATUS=OK
+    (( CW_COUNT < CLOSE_WAIT_WARN )) || CW_STATUS=WARN
+    mapfile -t CW_TOP < <(top_ports cw_ports)
+
+    # SYN-RECV: half-open handshakes; a large backlog suggests a SYN flood.
+    SYN_COUNT=${TCP[SYN-RECV]:-0}
+    SYN_STATUS=OK
+    (( SYN_COUNT < SYN_RECV_WARN )) || SYN_STATUS=WARN
+    mapfile -t SYN_TOP < <(top_ports syn_ports)
+    SYNCOOKIES=''
+    read -r SYNCOOKIES 2>/dev/null < "${LST_ROOT}/proc/sys/net/ipv4/tcp_syncookies" || true
+
+    # TIME-WAIT: each one pins a local ephemeral port for ~60s; too many and
+    # outbound connections start failing with EADDRNOTAVAIL.
+    read -r lo hi < "${LST_ROOT}/proc/sys/net/ipv4/ip_local_port_range"
+    EPHEMERAL=$(( hi - lo + 1 ))
+    TW_COUNT=${TCP[TIME-WAIT]:-0}
+    TW_PCT=$(( TW_COUNT * 100 / EPHEMERAL ))
+    TW_STATUS=OK
+    (( TW_PCT < TIME_WAIT_WARN )) || TW_STATUS=WARN
+
+    lst_worse STATUS "$CW_STATUS"
+    lst_worse STATUS "$SYN_STATUS"
+    lst_worse STATUS "$TW_STATUS"
+}
+
+# ==============================================================================
+# Listening sockets
+# ==============================================================================
+
+load_allowlist() {
+    local proto port proc
+    declare -gA ALLOW=()
+    [[ -n "$ALLOW_FILE" ]] || return 0
+    while read -r proto port proc _; do
+        [[ -z "$proto" || "$proto" == \#* ]] && continue
+        ALLOW["${proto,,}/${port}"]="${proc:-*}"
+    done < "$ALLOW_FILE"
+}
+
+# scope <address>: loopback, any (all interfaces) or address.
+scope() {
+    case "$1" in
+        127.*|'[::1]'|'[::ffff:127.'*|*%lo) echo loopback ;;
+        '*'|0.0.0.0|'[::]')                 echo any ;;
+        *)                                  echo address ;;
+    esac
+}
+
+check_listeners() {
+    local proto local_addr rest addr port proc sc allowed want key
+    local proc_re='users:\(\("([^"]+)"'
+    L_PROTO=() L_ADDR=() L_PORT=() L_PROC=() L_SCOPE=() L_ALLOWED=()
+    LISTEN_STATUS=OK UNEXPECTED=0 PUBLIC=0
+    load_allowlist
+
+    # Columns: Netid State Recv-Q Send-Q Local:Port Peer:Port [Process]
+    while read -r proto _ _ _ local_addr _ rest; do
+        port="${local_addr##*:}"
+        addr="${local_addr%:*}"
+        proc='-'
+        [[ "$rest" =~ $proc_re ]] && proc="${BASH_REMATCH[1]}"
+        sc="$(scope "$addr")"
+
+        allowed=''
+        if [[ "$sc" != loopback ]]; then
+            PUBLIC=$(( PUBLIC + 1 ))
+            if [[ -n "$ALLOW_FILE" ]]; then
+                key="${proto}/${port}"
+                want="${ALLOW[$key]:-}"
+                # Process names are only visible as root; without them the
+                # port match is the best available evidence.
+                if [[ -n "$want" && ( "$want" == '*' || "$proc" == '-' || "$proc" == "$want" ) ]]; then
+                    allowed=true
+                else
+                    allowed=false
+                    UNEXPECTED=$(( UNEXPECTED + 1 ))
+                fi
+            fi
+        fi
+        L_PROTO+=("$proto") L_ADDR+=("$addr") L_PORT+=("$port") L_PROC+=("$proc")
+        L_SCOPE+=("$sc") L_ALLOWED+=("$allowed")
+    done < <(ss -H -t -u -l -n -p 2>/dev/null \
+        | awk '{ port = $5; sub(/.*:/, "", port); print $1 "\t" port "\t" $0 }' \
+        | sort -t $'\t' -k1,1 -k2,2n | cut -f 3-)
+
+    (( UNEXPECTED == 0 )) || LISTEN_STATUS=WARN
+    lst_worse STATUS "$LISTEN_STATUS"
+}
+
+# ==============================================================================
+# DNS latency
+# ==============================================================================
+
+# now_us: monotonic-enough wall clock in microseconds (EPOCHREALTIME is bash 5+).
+now_us() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        echo "${EPOCHREALTIME//[!0-9]/}"
+    else
+        echo $(( $(date +%s%N) / 1000 ))
+    fi
+}
+
+# resolve <resolver>: sets Q_MS, Q_RESULT (NOERROR, NXDOMAIN, TIMEOUT, ...)
+# and Q_SERVER. dig reports server-side query time; without dig the system
+# resolver is timed end-to-end through getent (NSS, including any cache).
+resolve() {
+    local resolver="$1" out start re_status='status: ([A-Z]+)' re_time='Query time: ([0-9]+) msec'
+    local re_server='SERVER: ([^#]+)#'
+    local -a target=()
+    Q_MS='' Q_RESULT='' Q_SERVER="$resolver"
+
+    if command -v dig >/dev/null 2>&1; then
+        [[ "$resolver" == system ]] || target=("@$resolver")
+        out="$(dig +tries=1 +time=2 "${target[@]}" "$DNS_NAME" A 2>&1)" || true
+        if [[ "$out" =~ $re_status ]]; then
+            Q_RESULT="${BASH_REMATCH[1]}"
+            [[ "$out" =~ $re_time ]] && Q_MS="${BASH_REMATCH[1]}"
+            [[ "$out" =~ $re_server ]] && Q_SERVER="${BASH_REMATCH[1]}"
+        else
+            Q_RESULT=TIMEOUT
+        fi
+    elif [[ "$resolver" == system ]]; then
+        start="$(now_us)"
+        if timeout 5 getent ahosts "$DNS_NAME" >/dev/null 2>&1; then
+            Q_RESULT=NOERROR
+        else
+            Q_RESULT=FAILED
+        fi
+        Q_MS=$(( ($(now_us) - start) / 1000 ))
+        Q_SERVER='system (getent)'
+    else
+        Q_RESULT=SKIPPED
+    fi
+}
+
+check_dns() {
+    local resolver st
+    local -a list=()
+    D_NAME=() D_SERVER=() D_MS=() D_RESULT=() D_STATUS=()
+    DNS_STATUS=OK
+    (( DNS )) || { DNS_STATUS=SKIP; return; }
+
+    IFS=, read -ra list <<< "$RESOLVERS"
+    for resolver in "${list[@]}"; do
+        resolve "$resolver"
+        if [[ "$Q_RESULT" == SKIPPED ]]; then
+            st=SKIP
+        elif [[ "$Q_RESULT" != NOERROR ]]; then
+            # A broken system resolver breaks everything on the host; an
+            # unreachable public resolver may just be an egress firewall.
+            if [[ "$resolver" == system ]]; then st=CRIT; else st=WARN; fi
+        elif [[ -n "$Q_MS" ]] && (( Q_MS >= DNS_WARN_MS )); then
+            st=WARN
+        else
+            st=OK
+        fi
+        D_NAME+=("$resolver") D_SERVER+=("$Q_SERVER") D_MS+=("$Q_MS") D_RESULT+=("$Q_RESULT") D_STATUS+=("$st")
+        lst_worse DNS_STATUS "$st"
+    done
+    lst_worse STATUS "$DNS_STATUS"
+}
+
+check_tcp
+check_listeners
+check_dns
+
+EXIT_CODE="$(lst_exit_code "$STATUS")"
+(( QUIET )) && exit "$EXIT_CODE"
+
+# ==============================================================================
+# Output
+# ==============================================================================
+
+ports_json() {
+    local entry port count out=()
+    for entry in "$@"; do
+        IFS=$'\t' read -r port count <<< "$entry"
+        out+=("$(printf '{"port":%s,"count":%s}' "$port" "$count")")
+    done
+    lst_json_join "${out[@]}"
+}
+
+render_json() {
+    local s key i states=() listeners=() dns=() allowed ms
+    for s in "${STATES[@]}"; do
+        key="${s,,}"
+        key="${key//-/_}"
+        [[ "$key" == estab ]] && key=established
+        states+=("\"${key}\":${TCP[$s]:-0}")
+    done
+    for i in "${!L_PROTO[@]}"; do
+        allowed="${L_ALLOWED[i]:-null}"
+        listeners+=("$(printf '{"proto":"%s","address":%s,"port":%s,"process":%s,"scope":"%s","allowed":%s}' \
+            "${L_PROTO[i]}" "$(lst_json_str "${L_ADDR[i]}")" "${L_PORT[i]}" \
+            "$(lst_json_str "${L_PROC[i]}")" "${L_SCOPE[i]}" "$allowed")")
+    done
+    for i in "${!D_NAME[@]}"; do
+        ms="${D_MS[i]:-null}"
+        dns+=("$(printf '{"resolver":%s,"server":%s,"result":"%s","latency_ms":%s,"status":"%s"}' \
+            "$(lst_json_str "${D_NAME[i]}")" "$(lst_json_str "${D_SERVER[i]}")" \
+            "${D_RESULT[i]}" "$ms" "${D_STATUS[i]}")")
+    done
+
+    printf '{"tool":"net-socket-triage","version":"%s","timestamp":"%s","hostname":%s,"status":"%s","exit_code":%s,' \
+        "$LST_VERSION" "$(lst_timestamp)" "$(lst_json_str "$(lst_hostname)")" "$STATUS" "$EXIT_CODE"
+    printf '"tcp":{"states":{%s},' "$(IFS=,; echo "${states[*]}")"
+    printf '"close_wait":{"count":%s,"top_ports":%s,"status":"%s"},' \
+        "$CW_COUNT" "$(ports_json "${CW_TOP[@]}")" "$CW_STATUS"
+    printf '"syn_recv":{"count":%s,"top_ports":%s,"syncookies":%s,"status":"%s"},' \
+        "$SYN_COUNT" "$(ports_json "${SYN_TOP[@]}")" "${SYNCOOKIES:-null}" "$SYN_STATUS"
+    printf '"time_wait":{"count":%s,"ephemeral_ports":%s,"pct":%s,"status":"%s"}},' \
+        "$TW_COUNT" "$EPHEMERAL" "$TW_PCT" "$TW_STATUS"
+    printf '"listeners":{"sockets":%s,"non_loopback":%s,"unexpected":%s,"allowlist":%s,"status":"%s"},' \
+        "$(lst_json_join "${listeners[@]}")" "$PUBLIC" "$UNEXPECTED" \
+        "$( [[ -n "$ALLOW_FILE" ]] && lst_json_str "$ALLOW_FILE" || echo null)" "$LISTEN_STATUS"
+    printf '"dns":{"name":%s,"resolvers":%s,"status":"%s"}}\n' \
+        "$(lst_json_str "$DNS_NAME")" "$(lst_json_join "${dns[@]}")" "$DNS_STATUS"
+}
+
+port_lines() {
+    local entry port count
+    for entry in "$@"; do
+        IFS=$'\t' read -r port count <<< "$entry"
+        printf 'local port %s: %s socket(s)\n' "$port" "$count"
+    done
+}
+
+render_text() {
+    local s i summary='' lines=() tag st
+    local -a tree=()
+
+    lst_header 'NETWORK SOCKET TRIAGE'
+    printf 'Host: %s%s%s | Resolver test name: %s\n\n' "$C_CYAN" "$(lst_hostname)" "$C_RESET" "$DNS_NAME"
+
+    for s in "${STATES[@]}"; do
+        [[ -n "${TCP[$s]:-}" ]] && summary+="${summary:+, }${s} ${TCP[$s]}"
+    done
+    lst_row INFO 'TCP States' "${summary:-no TCP sockets}"
+
+    lst_row "$CW_STATUS" 'CLOSE-WAIT' "${CW_COUNT} socket(s) (warn at ${CLOSE_WAIT_WARN}; app not closing sockets)"
+    mapfile -t tree < <(port_lines "${CW_TOP[@]}")
+    (( CW_COUNT == 0 )) || lst_tree "${tree[@]}"
+
+    lst_row "$SYN_STATUS" 'SYN-RECV' "${SYN_COUNT} half-open (warn at ${SYN_RECV_WARN}; syncookies=${SYNCOOKIES:-?})"
+    mapfile -t tree < <(port_lines "${SYN_TOP[@]}")
+    (( SYN_COUNT == 0 )) || lst_tree "${tree[@]}"
+
+    lst_row "$TW_STATUS" 'TIME-WAIT' "${TW_COUNT} socket(s) = ${TW_PCT}% of ${EPHEMERAL} ephemeral ports"
+
+    if [[ -n "$ALLOW_FILE" ]]; then
+        lst_row "$LISTEN_STATUS" 'Listening Ports' "${PUBLIC} non-loopback, ${UNEXPECTED} not in allowlist"
+    else
+        lst_row INFO 'Listening Ports' "${PUBLIC} non-loopback listener(s) (no --allow list given)"
+    fi
+    for i in "${!L_PROTO[@]}"; do
+        [[ "${L_SCOPE[i]}" == loopback ]] && continue
+        case "${L_ALLOWED[i]}" in
+            false) tag="$(lst_status_color WARN) unexpected" ;;
+            true)  tag='allowed' ;;
+            *)     tag='' ;;
+        esac
+        lines+=("$(printf '%-3s %-6s %-18s %-16s%s' "${L_PROTO[i]}" "${L_PORT[i]}" "${L_ADDR[i]}" "${L_PROC[i]}" "$tag")")
+    done
+    (( ${#lines[@]} == 0 )) || lst_tree "${lines[@]}"
+
+    if [[ "$DNS_STATUS" == SKIP ]]; then
+        lst_row SKIP 'DNS Latency' 'disabled with --no-dns'
+    else
+        lst_row "$DNS_STATUS" 'DNS Latency' "resolve ${DNS_NAME} (warn at ${DNS_WARN_MS} ms)"
+        lines=()
+        for i in "${!D_NAME[@]}"; do
+            st="${D_STATUS[i]}"
+            case "${D_RESULT[i]}" in
+                SKIPPED) lines+=("${D_NAME[i]}: skipped (install dig: bind-utils / dnsutils / bind)") ;;
+                NOERROR) lines+=("${D_SERVER[i]}: ${D_MS[i]} ms$( [[ "$st" == OK ]] || printf '  %s' "$(lst_status_color "$st")")") ;;
+                *)       lines+=("${D_SERVER[i]}: ${D_RESULT[i]}  $(lst_status_color "$st")") ;;
+            esac
+        done
+        lst_tree "${lines[@]}"
+    fi
+
+    lst_rule '-'
+    printf 'Triage Result: %s (EXIT %s)\n' "$(lst_status_color "$STATUS")" "$EXIT_CODE"
+    lst_rule '='
+}
+
+if (( JSON )); then
+    render_json
+else
+    render_text
+fi
+exit "$EXIT_CODE"
