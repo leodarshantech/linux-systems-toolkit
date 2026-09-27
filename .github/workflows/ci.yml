@@ -14,7 +14,7 @@ jobs:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install ShellCheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
@@ -43,7 +43,7 @@ jobs:
       - name: Install dependencies
         run: ${{ matrix.setup }}
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Run test suites
         run: make test
@@ -52,7 +52,7 @@ jobs:
     name: systemd units & install
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Verify units and print security exposure scores
         run: make verify-units

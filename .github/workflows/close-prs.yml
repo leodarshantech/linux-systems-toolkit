@@ -16,7 +16,7 @@ jobs:
     if: github.actor != github.repository_owner
     steps:
       - name: Close PR and Leave Polite Notice
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             await github.rest.pulls.update({
