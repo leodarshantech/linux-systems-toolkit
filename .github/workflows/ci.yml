@@ -2,31 +2,63 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
-  lint-and-test:
-    name: Lint & Test Suite
+  lint:
+    name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Install ShellCheck & Utilities
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck python3
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
 
-      - name: Run ShellCheck Linting
-        run: |
-          shellcheck bin/* tests/*.sh
+      - name: Lint
+        run: make lint
 
-      - name: Run Automated Test Suite
-        run: |
-          make test
+  test:
+    name: Tests (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: Ubuntu 24.04
+            image: ubuntu:24.04
+            setup: apt-get update && apt-get install -y --no-install-recommends make python3 iproute2 zstd
+          - distro: AlmaLinux 10
+            image: almalinux:10
+            setup: dnf install -y make python3 iproute zstd findutils tar gzip util-linux
+          - distro: Arch Linux
+            image: archlinux:latest
+            setup: pacman -Syu --noconfirm make python iproute2 zstd
+    steps:
+      - name: Install dependencies
+        run: ${{ matrix.setup }}
 
-      - name: Test Systemd Unit Syntax
+      - uses: actions/checkout@v4
+
+      - name: Run test suites
+        run: make test
+
+  systemd:
+    name: systemd units & install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify units and print security exposure scores
+        run: make verify-units
+
+      - name: Install into a staging root and run the installed tool
         run: |
-          systemd-analyze verify systemd/*.service systemd/*.timer || true
+          make install DESTDIR="$RUNNER_TEMP/root" PREFIX=/usr
+          find "$RUNNER_TEMP/root" -type f | sort
+          "$RUNNER_TEMP/root/usr/bin/sys-health-audit" --json || [ $? -le 2 ]
