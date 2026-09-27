@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# sys-log-pruner — emergency log cleanup when the log filesystem fills up
+#
+# Does nothing while the filesystem holding the log directory is below the
+# threshold. Above it, vacuums archived systemd journal files and deletes old
+# *rotated* log files. Active log files are never touched.
+#
+# Part of linux-systems-toolkit: https://github.com/leodarshantech/linux-systems-toolkit
+# Author: Leo Darshan (@leodarshantech)
+# License: MIT
+# ==============================================================================
+
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+for lib in "${self%/*}/../lib/common.sh" "${self%/*}/../lib/linux-systems-toolkit/common.sh"; do
+    if [[ -r "$lib" ]]; then
+        # shellcheck source=../lib/common.sh
+        . "$lib"
+        break
+    fi
+done
+[[ -n "${LST_VERSION:-}" ]] || { echo "${0##*/}: cannot find lib/common.sh" >&2; exit 2; }
+
+LST_USAGE_EXIT=2
+
+THRESHOLD=90
+JOURNAL_SIZE=500M
+MAX_AGE=7
+LOG_DIR=/var/log
+JOURNAL=1
+FORCE=0
+DRY_RUN=0
+
+usage() {
+    cat <<EOF
+Usage: ${LST_PROG} [OPTIONS]
+
+Free space on the log filesystem once it crosses a usage threshold:
+  1. vacuum archived systemd journal files down to --journal-size
+  2. delete rotated logs (*.gz, *.xz, *.zst, *.bz2, *.old, *.1, name-YYYYMMDD)
+     older than --max-age days
+Active log files and the journal directory itself are never deleted.
+
+Options:
+  -t, --threshold PCT       Act only at or above PCT% usage   (default: ${THRESHOLD})
+  -s, --journal-size SIZE   Journal size to vacuum down to    (default: ${JOURNAL_SIZE})
+  -a, --max-age DAYS        Minimum age of rotated logs to delete (default: ${MAX_AGE})
+  -l, --log-dir DIR         Log directory                     (default: ${LOG_DIR})
+      --no-journal          Do not vacuum the systemd journal
+  -f, --force               Prune even when below the threshold
+  -n, --dry-run             Report what would be removed; change nothing
+  -q, --quiet               Only log warnings and errors
+  -v, --version             Print version and exit
+  -h, --help                Print this help and exit
+
+Exit status: 0 usage below threshold (before or after pruning),
+             1 still at or above threshold after pruning, or an error,
+             2 usage error.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)         usage; exit 0 ;;
+        -v|--version)      echo "${LST_PROG} ${LST_VERSION}"; exit 0 ;;
+        -t|--threshold)    lst_need_arg "$@"; lst_uint "$1" "$2" THRESHOLD; shift ;;
+        -s|--journal-size) lst_need_arg "$@"; JOURNAL_SIZE="$2"; shift ;;
+        -a|--max-age)      lst_need_arg "$@"; lst_uint "$1" "$2" MAX_AGE; shift ;;
+        -l|--log-dir)      lst_need_arg "$@"; LOG_DIR="$2"; shift ;;
+        --no-journal)      JOURNAL=0 ;;
+        -f|--force)        FORCE=1 ;;
+        -n|--dry-run)      DRY_RUN=1 ;;
+        -q|--quiet)        LST_QUIET=1 ;;
+        *)                 lst_usage_error "unknown option '$1'" ;;
+    esac
+    shift
+done
+
+(( THRESHOLD >= 1 && THRESHOLD <= 100 )) || lst_usage_error "--threshold must be 1-100"
+[[ "$JOURNAL_SIZE" =~ ^[0-9]+[KMGT]?$ ]] || lst_usage_error "--journal-size expects e.g. 500M or 2G"
+[[ -d "$LOG_DIR" ]] || lst_die "log directory does not exist: $LOG_DIR"
+LOG_DIR="$(realpath -- "$LOG_DIR")"
+
+# usage_pct: used % of the filesystem holding LOG_DIR.
+usage_pct() {
+    df -P -- "$LOG_DIR" | awk 'NR == 2 { sub(/%/, "", $5); print $5 }'
+}
+
+vacuum_journal() {
+    local line
+    if (( ! JOURNAL )) || ! command -v journalctl >/dev/null 2>&1; then
+        return 0
+    fi
+    if (( DRY_RUN )); then
+        lst_log INFO "would run: journalctl --vacuum-size=${JOURNAL_SIZE} ($(journalctl --disk-usage 2>/dev/null || echo 'usage unknown'))"
+        return 0
+    fi
+    # Only archived journal files are removed; the active ones stay open.
+    while IFS= read -r line; do
+        [[ "$line" == *freed* || "$line" == *Failed* ]] && lst_log INFO "journal: $line"
+    done < <(journalctl --vacuum-size="$JOURNAL_SIZE" 2>&1 || true)
+}
+
+# prune_rotated: delete rotated logs older than MAX_AGE days. The journal
+# directory is skipped (journalctl owns it) and -xdev keeps us on one fs.
+prune_rotated() {
+    local size path count=0 freed=0
+    while IFS=$'\t' read -r -d '' size path; do
+        if (( DRY_RUN )); then
+            lst_log INFO "would delete $path ($(lst_fmt_bytes "$size"))"
+        elif rm -f -- "$path"; then
+            lst_log INFO "deleted $path ($(lst_fmt_bytes "$size"))"
+        else
+            lst_log WARN "could not delete $path"
+            continue
+        fi
+        count=$(( count + 1 ))
+        freed=$(( freed + size ))
+    done < <(find "$LOG_DIR" -xdev -path "$LOG_DIR/journal" -prune -o -type f \
+        \( -name '*.gz' -o -name '*.xz' -o -name '*.zst' -o -name '*.bz2' -o -name '*.lz4' \
+           -o -name '*.old' -o -name '*.[0-9]' -o -name '*.[0-9][0-9]' \
+           -o -name '*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]' \) \
+        -mmin +$(( MAX_AGE * 1440 )) -printf '%s\t%p\0' 2>/dev/null)
+
+    if (( DRY_RUN )); then
+        lst_log INFO "rotated logs: ${count} file(s), $(lst_fmt_bytes "$freed") would be freed"
+    else
+        lst_log INFO "rotated logs: ${count} file(s) deleted, $(lst_fmt_bytes "$freed") freed"
+    fi
+}
+
+before="$(usage_pct)"
+lst_is_uint "$before" || lst_die "could not read filesystem usage for $LOG_DIR"
+
+if (( before < THRESHOLD && ! FORCE )); then
+    lst_log INFO "${LOG_DIR} filesystem at ${before}% (threshold ${THRESHOLD}%); nothing to do"
+    exit 0
+fi
+
+if (( before >= THRESHOLD )); then
+    lst_log WARN "${LOG_DIR} filesystem at ${before}% (threshold ${THRESHOLD}%); pruning"
+else
+    lst_log INFO "${LOG_DIR} filesystem at ${before}%; pruning (--force)"
+fi
+
+vacuum_journal
+prune_rotated
+
+after="$(usage_pct)"
+if (( DRY_RUN )); then
+    lst_log INFO "dry run complete; nothing was changed"
+elif (( after >= THRESHOLD )); then
+    lst_log ERROR "${LOG_DIR} filesystem still at ${after}% after pruning; find the growing file with: du -xh ${LOG_DIR} | sort -h | tail"
+    exit 1
+else
+    lst_log INFO "${LOG_DIR} filesystem now at ${after}% (was ${before}%)"
+fi
+exit 0
