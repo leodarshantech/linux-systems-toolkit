@@ -364,7 +364,7 @@ if [[ "$JSON_MODE" -eq 1 ]]; then
     "inodes": $INODE_JSON,
     "systemd": {
       "failed_units_count": $FAILED_UNITS_COUNT,
-      "failed_units": [$(if [[ -n "$FAILED_UNITS_LIST" ]]; then echo "\"$(echo "$FAILED_UNITS_LIST" | sed 's/,/","/g')\""; fi)],
+      "failed_units": [$(if [[ -n "$FAILED_UNITS_LIST" ]]; then echo "\"${FAILED_UNITS_LIST//,/\",\"}\""; fi)],
       "status": "$SYSTEMD_STATUS"
     },
     "processes": {
