@@ -1,0 +1,33 @@
+name: Close External PRs
+
+on:
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  issues: write
+
+jobs:
+  auto-close:
+    name: Auto Close External PR
+    runs-on: ubuntu-latest
+    # Only close PRs opened by outside users, never your own
+    if: github.actor != github.repository_owner
+    steps:
+      - name: Close PR and Leave Polite Notice
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              state: 'closed'
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: 'Thank you for your interest! This is a personal portfolio and engineering lab repository. External pull requests are not accepted.'
+            });

@@ -109,6 +109,11 @@ make lint
 
 ---
 
+## 🤝 Contributing
+This is an individual learning, homelab, and personal career portfolio repository. As such, external pull requests and code contributions are not accepted. Feel free to fork and adapt the code for your own personal use under the MIT License.
+
+---
+
 ## 📄 License
 This project is licensed under the [MIT License](LICENSE).
 Author: **Leo Darshan** ([@leodarshantech](https://github.com/leodarshantech)).
