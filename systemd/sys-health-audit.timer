@@ -1,10 +1,11 @@
 [Unit]
-Description=Hourly Schedule for Linux Systems Health & Security Posture Audit
+Description=Hourly Linux system health & security posture audit
 Documentation=https://github.com/leodarshantech/linux-systems-toolkit
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=1h
+OnCalendar=hourly
+RandomizedDelaySec=5min
+# Run once at boot if the host was off when a run was due.
 Persistent=true
 
 [Install]

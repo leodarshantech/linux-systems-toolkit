@@ -1,30 +1,47 @@
 [Unit]
-Description=Linux Systems Health & Security Posture Audit
+Description=Linux system health & security posture audit
 Documentation=https://github.com/leodarshantech/linux-systems-toolkit
-After=network.target
+# Started by sys-health-audit.timer; enable the timer, not this unit.
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/sys-health-audit --quiet
-StandardOutput=journal
-StandardError=journal
+# One JSON document per run lands in the journal for Fluent Bit / Vector:
+#   journalctl -u sys-health-audit -o cat -n 1 | jq .
+ExecStart=/usr/local/bin/sys-health-audit --json
+# Exit 1 (WARN) and 2 (CRIT) are audit results, not unit failures. Treating
+# them as failures would make this unit report itself in the next run's
+# failed-units check, latching the host at CRIT.
+SuccessExitStatus=1 2
 
-# ==============================================================================
-# Security & Process Sandboxing Hardening
-# ==============================================================================
+# --- Least privilege ---------------------------------------------------------
+# Throwaway unprivileged user; systemd-journal membership lets it read sshd logs.
+DynamicUser=yes
+SupplementaryGroups=systemd-journal
+CapabilityBoundingSet=
+AmbientCapabilities=
 NoNewPrivileges=yes
+
+# --- Filesystem & kernel sandbox ---------------------------------------------
 ProtectSystem=strict
 ProtectHome=read-only
-ProtectKernelTunables=yes
-ProtectControlGroups=yes
 PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+UMask=0077
+
+# --- Network & syscalls ------------------------------------------------------
+# AF_UNIX is kept so systemctl can query PID 1 over D-Bus.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
-RestrictRealtime=yes
-
-# Capabilities required for low-level inspection
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH
-
-[Install]
-WantedBy=multi-user.target
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
